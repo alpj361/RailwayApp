@@ -61,20 +61,50 @@ class TweetExtractor:
         # Set user agent
         self.options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36')
         
-    def _setup_driver(self):
-        """
-        Set up and return a configured Chrome WebDriver.
+   def _setup_driver(self):
+    """
+    Set up and return a configured Chrome WebDriver.
+    
+    Returns:
+        webdriver.Chrome: Configured Chrome WebDriver instance
+    """
+    try:
+        # Try to use the ChromeDriverManager with a specific installation path
+        driver_path = ChromeDriverManager().install()
         
-        Returns:
-            webdriver.Chrome: Configured Chrome WebDriver instance
-        """
+        # Make sure we're using the actual executable and not a text file
+        if "THIRD_PARTY_NOTICES" in driver_path:
+            # Try to find the correct executable in the same directory
+            import os
+            driver_dir = os.path.dirname(driver_path)
+            possible_drivers = [
+                os.path.join(driver_dir, "chromedriver"),
+                os.path.join(driver_dir, "chromedriver.exe"),
+                os.path.join(os.path.dirname(driver_dir), "chromedriver"),
+                os.path.join(os.path.dirname(driver_dir), "chromedriver.exe")
+            ]
+            
+            for possible_driver in possible_drivers:
+                if os.path.exists(possible_driver) and os.access(possible_driver, os.X_OK):
+                    driver_path = possible_driver
+                    break
+        
+        logger.info(f"Using ChromeDriver at: {driver_path}")
+        service = Service(driver_path)
+        driver = webdriver.Chrome(service=service, options=self.options)
+        driver.set_page_load_timeout(self.PAGE_LOAD_TIMEOUT)
+        return driver
+    except Exception as e:
+        logger.error(f"Failed to set up Chrome driver: {str(e)}")
+        
+        # Fallback: Try to create the driver without specifying the path
         try:
-            service = Service(ChromeDriverManager().install())
-            driver = webdriver.Chrome(service=service, options=self.options)
+            logger.info("Trying fallback method to create driver...")
+            driver = webdriver.Chrome(options=self.options)
             driver.set_page_load_timeout(self.PAGE_LOAD_TIMEOUT)
             return driver
-        except Exception as e:
-            logger.error(f"Failed to set up Chrome driver: {str(e)}")
+        except Exception as e2:
+            logger.error(f"Fallback method also failed: {str(e2)}")
             raise
         
     def _cleanup(self, driver):
