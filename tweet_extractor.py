@@ -41,7 +41,7 @@ class TweetExtractor:
         """Initialize the TweetExtractor with necessary configurations."""
         # Chrome options for headless browser
         self.options = Options()
-        self.options.add_argument('--headless')
+        self.options.add_argument('--headless=new')  # Use new headless mode
         self.options.add_argument('--no-sandbox')
         self.options.add_argument('--disable-dev-shm-usage')
         self.options.add_argument('--disable-gpu')
@@ -56,10 +56,21 @@ class TweetExtractor:
         # Reduce memory usage
         self.options.add_argument('--js-flags=--expose-gc')
         self.options.add_argument('--disable-features=site-per-process')
-        self.options.add_argument('--disable-dev-shm-usage')
         
-        # Set user agent
-        self.options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36')
+        # Improve stability in containerized environments
+        self.options.add_argument('--disable-dev-shm-usage')
+        self.options.add_argument('--disable-software-rasterizer')
+        self.options.add_argument('--disable-setuid-sandbox')
+        
+        # Set user agent - use a more recent Chrome version
+        self.options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+        
+        # Class-level function for extracting numbers from text
+        self.extraer_numero_de_texto = lambda texto: self._extract_number_from_text(texto)
+        
+        # Increase timeouts for Railway environment
+        self.PAGE_LOAD_TIMEOUT = 30  # Increased from 20
+        self.ELEMENT_TIMEOUT = 15    # Increased from 10
         
     def _setup_driver(self):
         """
@@ -69,25 +80,79 @@ class TweetExtractor:
             webdriver.Chrome: Configured Chrome WebDriver instance
         """
         try:
-            # Try to use the ChromeDriverManager with a specific installation path
-            driver_path = ChromeDriverManager().install()
+            import os
+            import stat
+            import platform
+            import subprocess
             
-            # Make sure we're using the actual executable and not a text file
-            if "THIRD_PARTY_NOTICES" in driver_path:
-                # Try to find the correct executable in the same directory
-                import os
-                driver_dir = os.path.dirname(driver_path)
-                possible_drivers = [
-                    os.path.join(driver_dir, "chromedriver"),
-                    os.path.join(driver_dir, "chromedriver.exe"),
-                    os.path.join(os.path.dirname(driver_dir), "chromedriver"),
-                    os.path.join(os.path.dirname(driver_dir), "chromedriver.exe")
-                ]
+            # Detect Chrome version in the environment
+            chrome_version = None
+            try:
+                if platform.system() == "Linux":
+                    # For Linux (Railway environment)
+                    chrome_process = subprocess.Popen(
+                        ['google-chrome', '--version'], 
+                        stdout=subprocess.PIPE, 
+                        stderr=subprocess.PIPE
+                    )
+                    chrome_output, _ = chrome_process.communicate()
+                    version_str = chrome_output.decode('utf-8').strip()
+                    chrome_version = version_str.split()[-1]  # Extract version number
+                    logger.info(f"Detected Chrome version: {chrome_version}")
+            except Exception as e:
+                logger.warning(f"Could not detect Chrome version: {str(e)}")
+            
+            # Install ChromeDriver with specific version if detected
+            if chrome_version:
+                driver_path = ChromeDriverManager(chrome_version=chrome_version).install()
+            else:
+                driver_path = ChromeDriverManager().install()
+            
+            # Verify we have the actual executable and not a text file
+            if "THIRD_PARTY_NOTICES" in driver_path or not os.access(driver_path, os.X_OK):
+                logger.warning(f"Found non-executable file: {driver_path}")
                 
+                # Search for the actual executable in parent directories
+                driver_dir = os.path.dirname(driver_path)
+                parent_dir = os.path.dirname(driver_dir)
+                grandparent_dir = os.path.dirname(parent_dir)
+                
+                # Define possible locations for the chromedriver binary
+                possible_drivers = []
+                
+                # Check for chromedriver in various possible locations
+                for search_dir in [driver_dir, parent_dir, grandparent_dir]:
+                    for root, dirs, files in os.walk(search_dir):
+                        for file in files:
+                            if file == "chromedriver" or file == "chromedriver.exe":
+                                possible_path = os.path.join(root, file)
+                                possible_drivers.append(possible_path)
+                
+                # Also check specific paths based on known directory structures
+                if platform.system() == "Linux":
+                    # Common paths in Linux environments
+                    possible_drivers.extend([
+                        os.path.join(driver_dir, "chromedriver"),
+                        os.path.join(parent_dir, "chromedriver"),
+                        os.path.join(parent_dir, "chromedriver-linux64", "chromedriver")
+                    ])
+                
+                # Find the first executable chromedriver
+                driver_path = None
                 for possible_driver in possible_drivers:
-                    if os.path.exists(possible_driver) and os.access(possible_driver, os.X_OK):
-                        driver_path = possible_driver
-                        break
+                    if os.path.exists(possible_driver):
+                        # Ensure the file is executable
+                        try:
+                            current_mode = os.stat(possible_driver).st_mode
+                            os.chmod(possible_driver, current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+                            driver_path = possible_driver
+                            logger.info(f"Found executable ChromeDriver at: {driver_path}")
+                            break
+                        except Exception as chmod_error:
+                            logger.warning(f"Could not set executable permissions on {possible_driver}: {str(chmod_error)}")
+                
+                if not driver_path:
+                    raise Exception("Could not find executable ChromeDriver binary")
             
             logger.info(f"Using ChromeDriver at: {driver_path}")
             service = Service(driver_path)
@@ -370,41 +435,185 @@ class TweetExtractor:
         }
         
         try:
-            # Try to find metrics elements
-            # Replies
-            reply_elements = driver.find_elements(By.CSS_SELECTOR, 'article[data-testid="tweet"] div[data-testid="reply"]')
-            if reply_elements:
-                reply_count_elements = reply_elements[0].find_elements(By.XPATH, './following-sibling::span')
-                if reply_count_elements:
-                    metrics['replies'] = reply_count_elements[0].text.strip()
+            # Get the tweet article element
+            article = WebDriverWait(driver, self.ELEMENT_TIMEOUT).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, 'article[data-testid="tweet"]'))
+            )
             
-            # Retweets
-            retweet_elements = driver.find_elements(By.CSS_SELECTOR, 'article[data-testid="tweet"] div[data-testid="retweet"]')
-            if retweet_elements:
-                retweet_count_elements = retweet_elements[0].find_elements(By.XPATH, './following-sibling::span')
-                if retweet_count_elements:
-                    metrics['retweets'] = retweet_count_elements[0].text.strip()
+            # Wait a bit longer for metrics to load
+            time.sleep(2)
             
-            # Likes
-            like_elements = driver.find_elements(By.CSS_SELECTOR, 'article[data-testid="tweet"] div[data-testid="like"]')
-            if like_elements:
-                like_count_elements = like_elements[0].find_elements(By.XPATH, './following-sibling::span')
-                if like_count_elements:
-                    metrics['likes'] = like_count_elements[0].text.strip()
+            # MÉTODO 1: Original approach - using direct selectors
+            try:
+                # Replies
+                reply_elements = driver.find_elements(By.CSS_SELECTOR, 'article[data-testid="tweet"] div[data-testid="reply"]')
+                if reply_elements:
+                    reply_count_elements = reply_elements[0].find_elements(By.XPATH, './following-sibling::span')
+                    if reply_count_elements:
+                        metrics['replies'] = reply_count_elements[0].text.strip()
+                
+                # Retweets
+                retweet_elements = driver.find_elements(By.CSS_SELECTOR, 'article[data-testid="tweet"] div[data-testid="retweet"]')
+                if retweet_elements:
+                    retweet_count_elements = retweet_elements[0].find_elements(By.XPATH, './following-sibling::span')
+                    if retweet_count_elements:
+                        metrics['retweets'] = retweet_count_elements[0].text.strip()
+                
+                # Likes
+                like_elements = driver.find_elements(By.CSS_SELECTOR, 'article[data-testid="tweet"] div[data-testid="like"]')
+                if like_elements:
+                    like_count_elements = like_elements[0].find_elements(By.XPATH, './following-sibling::span')
+                    if like_count_elements:
+                        metrics['likes'] = like_count_elements[0].text.strip()
+                
+                # Views
+                view_elements = driver.find_elements(By.CSS_SELECTOR, 'article[data-testid="tweet"] a[aria-label*="view"]')
+                if view_elements:
+                    metrics['views'] = view_elements[0].text.strip()
+                
+                logger.info(f"Method 1 metrics: {metrics}")
+            except Exception as e:
+                logger.warning(f"Error in metrics extraction method 1: {str(e)}")
             
-            # Views
-            view_elements = driver.find_elements(By.CSS_SELECTOR, 'article[data-testid="tweet"] a[aria-label*="view"]')
-            if view_elements:
-                metrics['views'] = view_elements[0].text.strip()
+            # MÉTODO 2: Using data-testid attributes with count suffix
+            try:
+                interaction_buttons = driver.find_elements(By.CSS_SELECTOR, '[data-testid$="-count"]')
+                for button in interaction_buttons:
+                    button_id = button.get_attribute('data-testid')
+                    count_text = button.text.strip()
+                    count = self._extract_number_from_text(count_text)
+                    
+                    logger.info(f"Found button: {button_id} = {count_text} → {count}")
+                    
+                    if 'reply-count' in button_id and (metrics['replies'] == '0' or count > int(metrics['replies'])):
+                        metrics['replies'] = str(count)
+                    elif 'retweet-count' in button_id and (metrics['retweets'] == '0' or count > int(metrics['retweets'])):
+                        metrics['retweets'] = str(count)
+                    elif 'like-count' in button_id and (metrics['likes'] == '0' or count > int(metrics['likes'])):
+                        metrics['likes'] = str(count)
+                    elif 'bookmark-count' in button_id:
+                        # Not used in the API response but collected for completeness
+                        pass
+            except Exception as e:
+                logger.warning(f"Error in metrics extraction method 2: {str(e)}")
             
-            # Clean up metrics (remove "K", "M", etc.)
-            for key in metrics:
-                metrics[key] = self._normalize_count(metrics[key])
+            # MÉTODO 3: Using aria-labels
+            try:
+                metrics_divs = article.find_elements(By.CSS_SELECTOR, '[role="group"] div')
+                for div in metrics_divs:
+                    aria_label = div.get_attribute('aria-label')
+                    if aria_label:
+                        logger.info(f"Found aria-label: {aria_label}")
+                        
+                        # Extract metrics based on aria-label text
+                        count = self._extract_number_from_text(aria_label)
+                        
+                        if ('respuesta' in aria_label.lower() or 'reply' in aria_label.lower()) and (metrics['replies'] == '0' or count > int(metrics['replies'])):
+                            metrics['replies'] = str(count)
+                        elif 'retweet' in aria_label.lower() and (metrics['retweets'] == '0' or count > int(metrics['retweets'])):
+                            metrics['retweets'] = str(count)
+                        elif ('me gusta' in aria_label.lower() or 'like' in aria_label.lower()) and (metrics['likes'] == '0' or count > int(metrics['likes'])):
+                            metrics['likes'] = str(count)
+                        elif ('view' in aria_label.lower() or 'vista' in aria_label.lower()) and (metrics['views'] == '0' or count > int(metrics['views'])):
+                            metrics['views'] = str(count)
+            except Exception as e:
+                logger.warning(f"Error in metrics extraction method 3: {str(e)}")
+            
+            # MÉTODO 4: Looking for buttons with numbers
+            try:
+                action_buttons = driver.find_elements(By.CSS_SELECTOR, '[role="button"]')
+                for btn in action_buttons:
+                    btn_text = btn.text.strip()
+                    if btn_text and any(c.isdigit() for c in btn_text):
+                        logger.info(f"Found button with number: {btn_text}")
+                        
+                        # Use button text and attributes to determine type
+                        btn_aria = btn.get_attribute('aria-label') or ''
+                        btn_id = btn.get_attribute('data-testid') or ''
+                        
+                        count = self._extract_number_from_text(btn_text)
+                        
+                        if ('reply' in btn_id.lower() or 'respuesta' in btn_aria.lower()) and (metrics['replies'] == '0' or count > int(metrics['replies'])):
+                            metrics['replies'] = str(count)
+                        elif ('retweet' in btn_id.lower() or 'retweet' in btn_aria.lower()) and (metrics['retweets'] == '0' or count > int(metrics['retweets'])):
+                            metrics['retweets'] = str(count)
+                        elif ('like' in btn_id.lower() or 'gusta' in btn_aria.lower()) and (metrics['likes'] == '0' or count > int(metrics['likes'])):
+                            metrics['likes'] = str(count)
+                        elif ('view' in btn_id.lower() or 'vista' in btn_aria.lower()) and (metrics['views'] == '0' or count > int(metrics['views'])):
+                            metrics['views'] = str(count)
+            except Exception as e:
+                logger.warning(f"Error in metrics extraction method 4: {str(e)}")
+            
+            # MÉTODO 5: Direct search for divs with numbers
+            try:
+                # Find all divs containing numeric text or with K/M at the end
+                potential_metrics = article.find_elements(By.XPATH, './/div[contains(text(), "K") or contains(text(), "M") or string-length(normalize-space()) <= 8]')
+                potential_metrics = [pm for pm in potential_metrics if pm.text.strip() and any(c.isdigit() for c in pm.text)]
+                
+                logger.info(f"Potential metrics found: {[pm.text for pm in potential_metrics]}")
+                
+                # If we find 3-5 metrics in order, they're likely reply, retweet, like, (view)
+                if 3 <= len(potential_metrics) <= 5:
+                    metrics_found = []
+                    for pm in potential_metrics:
+                        if pm.text.strip() and any(c.isdigit() for c in pm.text):
+                            metrics_found.append(self._extract_number_from_text(pm.text))
+                    
+                    logger.info(f"Numeric metrics extracted: {metrics_found}")
+                    
+                    # Assign in typical order if we have 3 or more
+                    if len(metrics_found) >= 3:
+                        if metrics['replies'] == '0':
+                            metrics['replies'] = str(metrics_found[0])
+                        if metrics['retweets'] == '0':
+                            metrics['retweets'] = str(metrics_found[1])
+                        if metrics['likes'] == '0':
+                            metrics['likes'] = str(metrics_found[2])
+                        if len(metrics_found) > 3 and metrics['views'] == '0':
+                            metrics['views'] = str(metrics_found[3])
+            except Exception as e:
+                logger.warning(f"Error in metrics extraction method 5: {str(e)}")
+            
+            # Log final metrics
+            logger.info(f"Final metrics: {metrics}")
             
             return metrics
         except Exception as e:
             logger.warning(f"Error extracting metrics: {str(e)}")
             return metrics
+    
+    def _extract_number_from_text(self, texto):
+        """
+        Extract numbers from text, including formats with K, M, etc.
+        
+        Args:
+            texto (str): Text containing a number
+            
+        Returns:
+            int: Extracted number value
+        """
+        if not texto:
+            return 0
+        
+        # Look for patterns like "2.5K", "3M", etc.
+        match = re.search(r'([\d,.]+)([KkMmBb])?', texto)
+        if not match:
+            return 0
+        
+        numero = match.group(1).replace(',', '.')
+        unidad = match.group(2).upper() if match.group(2) else ''
+        
+        try:
+            valor = float(numero)
+            if unidad == 'K':
+                valor *= 1000
+            elif unidad == 'M':
+                valor *= 1000000
+            elif unidad == 'B':
+                valor *= 1000000000
+            return int(valor)
+        except:
+            return 0
     
     def _normalize_count(self, count_str):
         """
